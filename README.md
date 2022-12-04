@@ -14,7 +14,7 @@ Modifications include:
 ## Installation
 Extract this folder into a directory, run `install.sh`, and follow the prompts.
 
-External drive installation is preferred and the only method that has been tested. The install script will utilize this information to construct a startup script accordingly so that it functions like a background service.
+External drive installation is preferred and the only method that has been tested on a live router. The install script will utilize this information to construct a startup script accordingly so that it functions like a background service.
 
 ## Usage
 Call `csvbwmon get|set` to change configuration options.
