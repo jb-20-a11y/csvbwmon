@@ -1,0 +1,1554 @@
+#!/bin/sh
+#
+# Traffic logging tool for OpenWRT-based routers
+#
+# Created by Emmanuel Brucy (e.brucy AT qut.edu.au)
+#
+# Based on work from Fredrik Erlandsson (erlis AT linux.nu)
+# Based on traff_graph script by twist - http://wiki.openwrt.org/RrdTrafficWatch
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+#
+# Modifications include:
+# - Renamed chain from RRDIPT to BWMON
+# - Monthly cycle capability
+# - Publish to CSV (using formulas to retain precision)
+# - Add numbers using shell function that allows infinite integer length
+# - Light web GUI
+# - Better ARP handling (record devices no longer alive)
+#
+
+echo "$PATH" | grep "/tmp/csvbwmon/cmd" > /dev/null 2>&1
+if [ $? -ne 0 ]
+then
+PATH="/tmp/csvbwmon/cmd:$PATH"
+fi
+[ -d /tmp/csvbwmon ] && cd /tmp/csvbwmon/cmd || cd /tmp
+INSTALL_TYPE=$(nvram get csvbwmon_type)
+INSTALL_DIR=$(nvram get csvbwmon_dir)
+PREFIX="csvbwmon"
+
+hexget_resource () {
+hexdump -ve '1/1 "%.2x\n"' "$1" > /tmp/comp_bash_$$.tmp
+{
+while IFS= read -r line
+do
+if [ $line != "" ]
+then
+l=$line
+fi
+echo -n "\x$l" >> /tmp/comp_out_$$.tmp
+done < /tmp/comp_bash_$$.tmp
+}
+cat /tmp/comp_out_$$.tmp
+rm -f /tmp/comp_bash_$$.tmp
+rm -f /tmp/comp_out_$$.tmp
+}
+
+resource_exists () {
+n=$(get_resource_name $1)
+if [ $INSTALL_TYPE == "file" ]
+then
+if [ -f "$INSTALL_DIR/$n" ]
+then
+echo "true"
+else
+echo "false"
+fi
+fi
+if [ $INSTALL_TYPE == "nvram" ]
+then
+if [ -z "$(nvram get $n)" ]
+then
+echo "false"
+else
+echo "true"
+fi
+fi
+}
+
+delete_resource () {
+n=$(get_resource_name $1)
+nn=${n}_null
+if [ $INSTALL_TYPE == "file" ]
+then
+rm -f "$INSTALL_DIR/$n"
+rm -f "$INSTALL_DIR/$nn" > /dev/null 2>&1
+fi
+if [ $INSTALL_TYPE == "nvram" ]
+then
+nvram unset $n
+nvram unset $nn > /dev/null 2>&1
+nvram commit
+fi
+}
+
+load_resource () {
+n=$(get_resource_name $1)
+nn="$n"'_null'
+if [ $INSTALL_TYPE = "file" ]
+then
+nb=$(cat "$INSTALL_DIR/$nn")
+h=$(hexget_resource "$INSTALL_DIR/$n")
+fi
+if [ $INSTALL_TYPE = "nvram" ]
+then
+nb=$(nvram get $nn)
+nvram get $n > /tmp/csvbwmon_init_$$.tmp
+h=$(hexget_resource "/tmp/csvbwmon_init_$$.tmp")
+rm -f /tmp/csvbwmon_init_$$.tmp
+fi
+ns=$(echo "$nb" | sed -e "s/\\\\/\\\\\\\\/g")
+r=$(echo -n "$h" | sed -e "s/$ns/\\\\0/g")
+if [[ ! $3 = 1 ]]
+then
+echo -ne "$r" > "$2"
+else
+echo -ne "$r" > "/tmp/csvbwmon_init_$$.tmp"
+rm -f /tmp/csvbwmon_init_$$.tmp
+fi
+}
+
+nvram_install_set () {
+echo "#!/bin/sh" > /tmp/comp-nvram_$$.sh
+echo -n "nvram set $1='" >> /tmp/comp-nvram_$$.sh
+if [[ $3 = 1 ]]
+then
+c=$(echo -n "$2" | sed -e "s/\\\\x27/\\\\x27\\\\x22\\\\x27\\\\x22\\\\x27/g")
+echo -ne "$c" >> /tmp/comp-nvram_$$.sh
+else
+c="$2"
+echo -n "$c" >> /tmp/comp-nvram_$$.sh
+fi
+echo "'" >> /tmp/comp-nvram_$$.sh
+echo "nvram commit" >> /tmp/comp-nvram_$$.sh
+sh /tmp/comp-nvram_$$.sh
+rm -f /tmp/comp-nvram_$$.sh
+}
+
+get_resource_name () {
+g="$PREFIX"'_'"$1"
+echo "$g"
+}
+
+write_nullbit () {
+n=$(get_resource_name $1)
+n="$n"'_null'
+if [ $INSTALL_TYPE = "file" ]
+then
+echo -n "$2" > "$INSTALL_DIR/$n"
+fi
+if [ $INSTALL_TYPE = "nvram" ]
+then
+nvram_install_set "$n" "$2" 0
+fi
+}
+
+write_body () {
+n=$(get_resource_name $1)
+if [ $INSTALL_TYPE = "file" ]
+then
+echo -ne "$2" > "$INSTALL_DIR/$n"
+fi
+if [ $INSTALL_TYPE = "nvram" ]
+then
+nvram_install_set "$n" "$2" 1
+fi
+}
+
+save_text_resource () {
+x=$(hexget_resource "$2")
+write_nullbit "$1" '\x00'
+write_body "$1" "$x"
+}
+
+sum_big () {
+n1=$1
+n2=$2
+l1=${#n1}
+l2=${#n2}
+if [ $l1 -gt $l2 ]
+then
+l=$l1
+else
+l=$l2
+fi
+l=$((l+1))
+n1=$(zero_pad $n1 $l)
+n2=$(zero_pad $n2 $l)
+i=0
+r=$n1
+while [[ $i -lt $l ]]
+do
+p=$((i+1))
+a=$(place_digits $n2 $p)
+r=$(add_r $r $a $p 0)
+i=$((i+1))
+done
+z=${r:0:1}
+if [ $z = "0" ]
+then
+r=${r:1}
+fi
+echo $r
+}
+
+get_num_place () {
+c=$1
+h=$2
+l=${#c}
+p=$((l-h))
+r=${c:p:1}
+echo $r
+}
+
+replace_digit () {
+n=$1
+p=$2
+d=$3
+l=${#n}
+m=$((l-p))
+if [[ $p = 1 ]]
+then
+if [[ $l = 1 ]]
+then
+echo $d
+else
+k=$((l-1))
+echo ${n:0:k}${d}
+fi
+elif [[ $l = $p ]]
+then
+if [[ $l = 1 ]]
+then
+echo $d
+else
+k=$l
+echo ${d}${n:1:k}
+fi
+else
+k=$((l-p))
+echo ${n:0:k}${d}${n:k+1}
+fi
+}
+
+place_digits () {
+n=$1
+p=$2
+l=${#n}
+c=$((l-p))
+i=0
+r=""
+while [[ $i -lt $l ]]
+do
+if [[ $c = $i ]]
+then
+r=${r}${n:c:1}
+else
+r=${r}0
+fi
+i=$((i+1))
+done
+echo $r
+}
+
+add_r () {
+n1=$1
+n2=$2
+p=$3
+co=$4
+d1=$(get_num_place $n1 $p)
+d2=$(get_num_place $n2 $p)
+l=${#n1}
+s=$((d1+d2+co))
+if [[ $s -gt 9 ]]
+then
+c=${s:0:1}
+d=${s:1:1}
+nd=$((l-p))
+ss1=${n1:0:nd}
+ss2=${n2:0:nd}
+pr=$(add_r $ss1 $ss2 1 $c)
+if [ $p -gt 1 ]
+then
+q=$((p-1))
+t=$((l-q))
+af=${n1:t:q}
+else
+af=""
+fi
+r=${pr}${d}${af}
+echo $r
+else
+r=$(replace_digit $n1 $p $s)
+echo $r
+fi
+}
+
+lighttpd_running () {
+psValue=$(ps | grep -c 'lighttpd -f')
+if [ "$psValue" = "2" ]
+then
+echo 'true'
+else
+echo 'false'
+fi
+}
+
+lock()
+{
+while [ -f /tmp/csvbwmon.lock ]; do
+if [ ! -d /proc/$(cat /tmp/csvbwmon.lock) ]; then
+rm -f /tmp/csvbwmon.lock
+fi
+sleep 1
+done
+echo $$ > /tmp/csvbwmon.lock
+}
+
+unlock()
+{
+rm -f /tmp/csvbwmon.lock
+}
+
+get_config () {
+[ -f /tmp/csvbwmon-conf_$$.tmp ] && rm -f /tmp/csvbwmon-conf_$$.tmp
+if [ -z "$2" ]
+then
+load_resource config /tmp/csvbwmon-conf_$$.tmp 0
+cf="/tmp/csvbwmon-conf_$$.tmp"
+else
+cf="$2"
+cp "$cf" "/tmp/csvbwmon-conf_$$.tmp"
+fi
+sed '/:/!d;/^ *#/d;s/:/ /;' < "$cf" | while read -r key val
+do
+if [ $key == $1 ]
+then
+echo "$val"
+rm -f /tmp/csvbwmon-conf_$$.tmp
+return
+fi
+done
+echo -n ""
+rm -f /tmp/csvbwmon-conf_$$.tmp
+return
+}
+
+set_config () {
+[ -f /tmp/csvbwmon-confg_$$.tmp ] && rm -f /tmp/csvbwmon-confg_$$.tmp
+[ -f /tmp/csvbwmon_new_$$.tmp ] && rm -f /tmp/csvbwmon_new_$$.tmp
+load_resource config /tmp/csvbwmon-confg_$$.tmp 0
+sed '/:/!d;/^ *#/d;s/:/ /;' < /tmp/csvbwmon-confg_$$.tmp | while read -r key val
+do
+if [ $key == $1 ]
+then
+y=0
+else
+# p=$(echo "$val" | sed -e 's/'"'"'/'"'"'"'"'"'"'"'"'/g')
+# echo -n "$key: '" >> /tmp/csvbwmon_new.tmp
+# echo -n "$p" >> /tmp/csvbwmon_new.tmp
+# echo "'" >> /tmp/csvbwmon_new.tmp
+echo "$key: $val" >> /tmp/csvbwmon_new_$$.tmp
+fi
+done
+# p=$(echo "$2" | sed -e 's/'"'"'/'"'"'"'"'"'"'"'"'/g')
+# echo -n "$1: '" >> /tmp/csvbwmon_new.tmp
+# echo -n "$p" >> /tmp/csvbwmon_new.tmp
+# echo "'" >> /tmp/csvbwmon_new.tmp
+echo "$1: $2" >> /tmp/csvbwmon_new_$$.tmp
+save_text_resource config /tmp/csvbwmon_new_$$.tmp
+rm -f /tmp/csvbwmon_new_$$.tmp
+rm -f /tmp/csvbwmon-confg_$$.tmp
+}
+
+list_archives () {
+if [ $INSTALL_TYPE == "file" ]
+then
+if [ ! -z $(ls -A "$mdd/archive") ]
+then
+for item in $(ls "$mdd/archive" | sort -V)
+do
+t=$(basename "$item" ".db")
+echo "$t"
+done
+fi
+fi
+if [ $INSTALL_TYPE == "nvram" ]
+then
+nvram get csvbwmon_archives > /tmp/csvbwmon_archives.tmp
+while IFS= read -r line
+do
+echo "$line"
+done < /tmp/csvbwmon_archives.tmp
+rm -f /tmp/csvbwmon_archives.tmp
+fi
+}
+
+get_free_nvram () {
+nvram show > /dev/null 2> /tmp/nvram_free.tmp
+fs=$(cat /tmp/nvram_free.tmp | grep "left" | cut -d '(' -f 2- | cut -d ' ' -f 1)
+echo "$fs"
+rm -f /tmp/nvram_free.tmp
+}
+
+get_archive () {
+if [ $INSTALL_TYPE == "file" ]
+then
+mdd=$(get_config datadir)
+if [ $1 == "current" ]
+then
+cat "$mdd/usage.db"
+else
+[ -f "$mdd/archive/$1.db" ] && cat "$mdd/archive/$1.db" || echo "Archive does not exist."
+fi
+fi
+if [ $INSTALL_TYPE == "nvram" ]
+then
+f=$(echo "$1" | sed -e 's/-//g')
+if [ $1 == "current" ]
+then
+[ $(resource_exists "currentData") == "true" ] && load_resource "currentData" /tmp/csvbwmon_ar.tmp && cat /tmp/csvbwmon_ar.tmp && rm -f /tmp/csvbwmon_ar.tmp
+else
+[ $(resource_exists "ar_$f") == "true" ] && load_resource "ar_$f" /tmp/csvbwmon_ar.tmp && cat /tmp/csvbwmon_ar.tmp && rm -f /tmp/csvbwmon_ar.tmp
+fi
+fi
+}
+
+archive_exists () {
+mdd=$(get_config datadir)
+if [ $INSTALL_TYPE == "file" ]
+then
+if [ -f "$mdd/archive/$1.db" ]
+then
+echo "true"
+else
+echo "false"
+fi
+fi
+if [ $INSTALL_TYPE == "nvram" ]
+then
+f=$(echo "$1" | sed -e 's/-//g')
+if [ $(resource_exists "ar_$f") == "true" ]
+then
+echo "true"
+else
+echo "false"
+fi
+fi
+}
+
+delete_archive () {
+if [ $INSTALL_TYPE == "file" ]
+then
+mdd=$(get_config datadir)
+[ -f "$mdd/archive/$1.db" ] && rm -f "$mdd/archive/$1.db" || echo "Archive does not exist."
+fi
+if [ $INSTALL_TYPE == "nvram" ]
+then
+f=$(echo "$1" | sed -e 's/-//g')
+if [ $(resource_exists "ar_$f") == "true" ]
+then
+delete_resource "ar_$f"
+[ -f /tmp/csvbwmon_new.tmp ] && rm -f /tmp/csvbwmon_new.tmp
+nvram get csvbwmon_archives > /tmp/csvbwmon_archives.tmp
+while IFS= read -r line
+do
+if [ ! $line == $1 ]
+then
+echo "$line" >> /tmp/csvbwmon_new.tmp
+fi
+done < /tmp/csvbwmon_archives.tmp
+rm -f /tmp/csvbwmon_archives.tmp
+if [ -f /tmp/csvbwmon_new.tmp ]
+then
+save_text_resource archives /tmp/csvbwmon_new.tmp
+rm -f /tmp/csvbwmon_new.tmp
+else
+delete_resource archives
+fi
+fi
+fi
+}
+
+check_archive () {
+nd=$(date +"%m-%d-%y")
+nt=$(date +"%k%M")
+fd=$(get_config "current")
+ft=$(get_config "archive-time")
+ft=$(echo "$ft" | sed -e 's/://g')
+x=1
+if [ -z $fd ]
+then
+x=0
+else
+if [ $fd == $nd ]
+then
+x=0
+else
+if [ $nt -lt $ft ]
+then
+x=0
+fi
+fi
+fi
+[ $x == 1 ] && echo "TRUE" || echo "FALSE"
+}
+
+setup_iptables () {
+c=$1
+t=$2
+w=$3
+iptables -N $c 2> /dev/null
+iptables -N "${t}_PRECOUNT" 2> /dev/null
+iptables -N "${t}_POSTCOUNT" 2> /dev/null
+iptables -L $t --line-numbers -n | grep "$c" | grep "2" > /dev/null
+if [ $? -ne 0 ]; then
+iptables -L $t -n | grep "$c" > /dev/null
+if [ $? -eq 0 ]; then
+iptables -D $t -j "${t}_POSTCOUNT"
+iptables -D $t -j $c
+iptables -D $t -j "${t}_PRECOUNT"
+iptables -I $t -j "${t}_POSTCOUNT"
+iptables -I $t -j $c
+iptables -I $t -j "${t}_PRECOUNT"
+else
+iptables -I $t -j "${t}_POSTCOUNT"
+iptables -I $t -j $c
+iptables -I $t -j "${t}_PRECOUNT"
+if [ $t == "INPUT" ]
+then
+iptables -C $c -i $w -j RETURN > /dev/null 2>&1 || iptables-save | grep -- "-A $c -i $w -j RETURN"
+if [ $? -ne 0 ]
+then
+iptables -I $c -i $w -j RETURN
+fi
+elif [ $t == "OUTPUT" ]
+then
+iptables -C $c -o $w -j RETURN > /dev/null 2>&1 || iptables-save | grep -- "-A $c -o $w -j RETURN"
+if [ $? -ne 0 ]
+then
+iptables -I $c -o $w -j RETURN
+fi
+elif [ $t == "FORWARD" ]
+then
+iptables -C $c -j BWMON_INPUT > /dev/null 2>&1 || iptables-save | grep -- "-A $c -j BWMON_INPUT"
+if [ $? -ne 0 ]
+then
+iptables -A $c -j BWMON_INPUT
+fi
+iptables -C $c -j BWMON_OUTPUT > /dev/null 2>&1 || iptables-save | grep -- "-A $c -j BWMON_OUTPUT"
+if [ $? -ne 0 ]
+then
+iptables -A $c -j BWMON_OUTPUT
+fi
+fi
+fi
+fi
+if [ $t == "FORWARD" ]
+then
+grep $w /proc/net/arp | grep -v IP | while read IP TYPE FLAGS MAC MASK IFACE
+do
+iptables -nL $c | grep "${IP} " > /dev/null
+if [ $? -ne 0 ]; then
+iptables -I $c -d ${IP} -j RETURN
+iptables -I $c -s ${IP} -j RETURN
+fi
+done
+fi
+}
+
+copy_arp () {
+if [ -f "/tmp/csvbwmon/other/arp.txt" ]
+then
+cat /proc/net/arp > /tmp/csv_arp.tmp
+if [ -f "/tmp/csv_arp.tmp" ]
+then
+sort -u /tmp/csv_arp.tmp /tmp/csvbwmon/other/arp.txt > /tmp/csv_arp_new.tmp
+cat /tmp/csv_arp_new.tmp > /tmp/csvbwmon/other/arp.txt
+rm -f /tmp/csv_arp.tmp
+rm -f /tmp/csv_arp_new.tmp
+fi
+else
+cat /proc/net/arp > /tmp/csvbwmon/other/arp.txt
+fi
+}
+
+convert_date () {
+m=$(echo "$1" | cut -d '-' -f 1)
+d=$(echo "$1" | cut -d '-' -f 2)
+y=$(echo "$1" | cut -d '-' -f 3)
+echo "$y-$m-$d"
+}
+
+date_human () {
+od=$(convert_date "$1")
+nd=$(date -d "$od" +"%m/%d/%Y")
+echo "$nd"
+}
+
+day_diff () {
+od=$(convert_date "$1")
+nd=$(date -d "$od $2 days" +"%m-%d-%y")
+echo "$nd"
+}
+
+month_diff () {
+od=$(convert_date "$1")
+nd=$(date -d "$od $2 months" +"%m-%d-%y")
+echo "$nd"
+}
+
+resolve_archive_list () {
+[ -f /tmp/date_$$.tmp ] && rm -f /tmp/date_$$.tmp
+touch /tmp/date_$$.tmp
+fd=$(get_config current)
+echo "$1" | grep ":" > /dev/null
+if [ $? -eq 0 ]
+then
+f=$(echo "$1" | cut -d ':' -f 1)
+l=$(echo "$1" | cut -d ':' -f 2)
+if [ $f == "cycle" -o $f == "arch_cycle" ]
+then
+v=$f
+f=$l
+mb=$(month_diff "$l" "+1")
+l=$(day_diff "$mb" "-1")
+fi
+[ $l == "current" ] && l=$fd
+while true
+do
+if [ $fd == $f ]
+then
+echo "current" >> /tmp/date_$$.tmp
+break
+else
+if [ $(archive_exists "$f") == "true" ]
+then
+echo "$f" >> /tmp/date_$$.tmp
+fi
+fi
+if [ $f == $l ]
+then
+break
+else
+f=$(day_diff $f "+1")
+fi
+done
+cat /tmp/date_$$.tmp
+rm -f /tmp/date_$$.tmp
+else
+if [ $1 == "current" ]
+then
+echo "current"
+else
+if [ $(archive_exists "$1") == "true" ]
+then
+echo "$1"
+fi
+fi
+fi
+}
+
+next_row () {
+[ -z "$1" ] && echo "A" && return
+r="$1"
+l="${r:0:1}"
+o="${r%?}"
+d="A B C D E F G H I J K L M N O P Q R S T U V W X Y Z"
+c="none"
+for lr in $(echo "$d")
+do
+if [ $c == "change" ]
+then
+echo "$o$lr"
+break
+fi
+if [ $lr == $l ]
+then
+if [ $l == "Z" ]
+then
+c="recur"
+else
+c="change"
+fi
+fi
+done
+if [ $c == "recur" ]
+then
+z=$(next_row "$o")
+echo "${z}A"
+fi
+}
+
+col_sums_o () {
+s=$2
+t=""
+while true
+do
+if [ -z "$t" ]
+then
+t="=$1$s"
+else
+t="$t+$1$s"
+fi
+if [ $s == $3 ]
+then
+echo "$t"
+break
+fi
+s=$((s+1))
+done
+}
+
+col_sums () {
+a=$(col_sums_o "$1" "$2" "$3")
+a=${a#?}
+f=$(echo "$a" | cut -d '+' -f 1)
+l=$(echo "$a" | rev | cut -d '+' -f 1 | rev)
+if [ $f == $l ]
+then
+echo "=$f"
+else
+echo "=SUM(${f}:${l})"
+fi
+}
+
+row_sums () {
+s=""
+i=0
+for r in $(echo "$1")
+do
+i=$((i+1))
+if [ -z "$s" ]
+then
+s="$r$2"
+else
+s="$s+$r$2"
+fi
+done
+if [ $i == 1 ]
+then
+echo "=$s"
+else
+f=$(echo "$1" | cut -d ' ' -f 1)
+l=$(echo "$1" | rev | cut -d ' ' -f 1 | rev)
+z=$2
+echo "=SUM(${f}${z}:${l}${z})"
+fi
+}
+
+excel_datedif () {
+f=$1
+y=$2
+z=$3
+echo "=DATEDIF(${f}${y}, ${f}${z}, "'""d""'")"
+}
+
+zero_pad () {
+s=$1
+l=$2
+while [ ${#s} -ne $l ]
+do
+s="0$s"
+done
+echo "$s"
+}
+
+make_csv () {
+ubn=$(get_config use-binary)
+if [ $ubn == "yes" ]
+then
+ubb=1024
+else
+ubb=1000
+fi
+resolve_archive_list "$1" > /tmp/list_$$.tmp
+nf="/tmp/db_export_$$.tmp"
+uf="/tmp/ar_$$.tmp"
+mc="/tmp/mac_$$.tmp"
+mc2="/tmp/mac2_$$.tmp"
+mc3="/tmp/mac3_$$.tmp"
+fc="/tmp/fc_$$.tmp"
+[ -f "$mc" ] && rm -f "$mc"
+[ -f "$mc2" ] && rm -f "$mc2"
+mdf="/tmp/dic_$$.tmp"
+[ -f "$mdf" ] && rm -f "$mdf"
+load_resource config "$mdf" 0
+while read ar
+do
+[ -f "$nf" ] && rm -f "$nf" && touch "$nf"
+uf="/tmp/ar_${ar}_$$.tmp"
+get_archive "$ar" > /tmp/ar_${ar}_$$.tmp
+mar=$(echo "$ar" | sed -e 's/-//g')
+while IFS=, read MAC USAGE_IN USAGE_OUT
+do
+echo "Preprocessing: $ar $MAC" 1>&2
+USAGE=$(sum_big "${USAGE_IN}" "${USAGE_OUT}")
+echo $USAGE,$MAC >> $nf
+ma=$(echo "$MAC" | sed -e 's/://g')
+eval "ma${mar}${ma}="'"$USAGE"'
+if [ -z $(eval "echo -n \$ma$ma") ]
+then
+echo "$MAC" >> "$mc"
+else
+eval 'CUR="$'"ma$ma"'"'
+USAGE=$(sum_big "$USAGE" "$CUR")
+fi
+eval "ma$ma="'"$USAGE"'
+done < "$uf"
+done < /tmp/list_$$.tmp
+ml=0
+while read MAC
+do
+ma=$(echo "$MAC" | sed -e 's/://g')
+eval 'CUR="$'"ma$ma"'"'
+nl=${#CUR}
+if [ $nl -gt $ml ]
+then
+ml=$nl
+fi
+done < "$mc"
+while read MAC
+do
+ma=$(echo "$MAC" | sed -e 's/://g')
+eval 'CUR="$'"ma$ma"'"'
+CUR=$(zero_pad $CUR $ml)
+echo "$CUR,$MAC" >> "$mc2"
+done < "$mc"
+rm -f "$mc"
+sort -r "$mc2" > "$mc3"
+ch='"WRT Usage","Date"'
+cn=""
+sr="C"
+st=""
+while IFS=, read USAGE MAC
+do
+if [ -z "$st" ]
+then
+st="$sr"
+else
+st="$st $sr"
+fi
+rn="$(lookup "$MAC" "$mdf")"
+cn="$cn,"'"'"$rn"'"'
+sr=$(next_row "$sr")
+done < "$mc3"
+# cp "$mc3" "/tmp/mac.txt"
+ch="$ch$cn"
+echo "$ch" > "$fc"
+zn=2
+while read ar
+do
+echo "Export: $ar" 1>&2
+uf="/tmp/ar_${ar}_$$.tmp"
+mar=$(echo "$ar" | sed -e 's/-//g')
+as=$(row_sums "$st" "$zn")
+if [ $ar == "current" ]
+then
+aa=$(get_config current)
+else
+aa="$ar"
+fi
+ad=$(date_human "$aa")
+# ad="=DATEVALUE("'"'"$ad"'"'")"
+cb="$as,$ad"
+while IFS=, read USAGE_T MAC
+do
+ma=$(echo "$MAC" | sed -e 's/://g')
+eval 'CUR="$'"ma${mar}${ma}"'"'
+if [ -z "$CUR" ]
+then
+USAGE=0
+else
+USAGE="$CUR"
+fi
+cb="$cb,=($USAGE/${ubb})"
+done < "$mc3"
+echo "$cb" >> "$fc"
+zn=$((zn+1))
+done < /tmp/list_$$.tmp
+fh='"Total WRT","Days in Cycle"'"$cn"
+echo "$fh" >> "$fc"
+zn=$((zn-1))
+dc=$(excel_datedif "B" 2 $zn)
+dc='"'"$dc"'+1"'
+td=$(col_sums "A" 2 $zn)
+fl="$td,$dc"
+for ft in $(echo "$st")
+do
+td=$(col_sums "$ft" 2 $zn)
+fl="$fl,$td"
+done
+echo "$fl" >> "$fc"
+rm -f "$mc3"
+rm -f /tmp/list_$$.tmp
+rm -f /tmp/ar_*_$$.tmp
+cat "$fc"
+rm -f "$fc"
+}
+
+get_mac () {
+mm=$(echo "$1" | sed -e 's/://g')
+get_config "mac-$mm" "$2"
+}
+
+set_mac () {
+mm=$(echo "$1" | sed -e 's/://g')
+set_config "mac-$mm" "$2"
+}
+
+lookup () {
+MAC=$1
+gm=$(get_mac "$MAC" "$2")
+if [ ! $MAC == "00:00:00:00:00:00" ]
+then
+if [ -z "$gm" ]
+then
+for USERSFILE in /tmp/dhcp.leases /tmp/dnsmasq.conf /etc/dnsmasq.conf /etc/hosts; do
+[ -e "$USERSFILE" ] || continue
+case $USERSFILE in
+/tmp/dhcp.leases )
+USER=$(grep -i "$MAC" $USERSFILE | cut -f4 -s -d' ')
+;;
+/etc/hosts )
+USER=$(grep "^$IP " $USERSFILE | cut -f2 -s -d' ')
+;;
+* )
+USER=$(grep -i "$MAC" "$USERSFILE" | cut -f2 -s -d,)
+;;
+esac
+[ "$USER" = "*" ] && USER=
+[ -n "$USER" ] && break
+done
+else
+USER="$gm"
+fi
+[ -z "$USER" ] && USER=${MAC}
+else
+if [ $MAC == "00:00:00:00:00:00" ]
+then
+USER="Router"
+fi
+fi
+echo "$USER"
+}
+
+read_mac () {
+[ -f /tmp/csvbwmon-conf_$$.tmp ] && rm -f /tmp/csvbwmon-conf_$$.tmp
+if [ -z "$2" ]
+then
+load_resource config /tmp/csvbwmon-conf_$$.tmp 0
+cf="/tmp/csvbwmon-conf_$$.tmp"
+else
+cf="$2"
+cp "$cf" "/tmp/csvbwmon-conf_$$.tmp"
+fi
+sed '/:/!d;/^ *#/d;s/:/ /;' < "$cf" | while read -r key val
+do
+if [ ${key:0:4} == "mac-" -a ! "$key" == "mac-000000000000" ]
+then
+addr=${key:4:12}
+addr=$(echo "$addr" | sed -e 's/.\{2\}/&\:/g')
+addr=${addr%?}
+echo "${addr}=${val}"
+fi
+done
+}
+
+write_mac () {
+[ -f /tmp/csvbwmon-conf_$$.tmp ] && rm -f /tmp/csvbwmon-conf_$$.tmp
+if [ -z "$1" ]
+then
+load_resource config /tmp/csvbwmon-conf_$$.tmp 0
+cf="/tmp/csvbwmon-conf_$$.tmp"
+else
+cf="$1"
+cp "$cf" "/tmp/csvbwmon-conf_$$.tmp"
+fi
+sed '/:/!d;/^ *#/d;s/:/ /;' < "$cf" | while read -r key val
+do
+if [ ! ${key:0:4} == "mac-" ]
+then
+addr=${key:4:12}
+addr=$(echo "$addr" | sed -e 's/.\{2\}/&\:/g')
+addr=${addr%?}
+echo "$key: $val" >> "/tmp/comp_new_$$.tmp"
+fi
+done
+while IFS='=' read -r mac name
+do
+nm=$(echo "$mac" | tr '[A-Z]' '[a-z]' | sed -e 's/://g')
+if [ ! "$nm" = "000000000000" ]
+then
+echo "mac-$nm: $name" >> /tmp/comp_new_$$.tmp
+fi
+done < "$2"
+echo "mac-000000000000: Router" >> /tmp/comp_new_$$.tmp
+save_text_resource config /tmp/comp_new_$$.tmp
+rm -f /tmp/comp_new_$$.tmp
+}
+
+case ${1} in
+
+"setup" )
+WAN_IFACE=$(nvram get wan_ifname)
+[ -z $WAN_IFACE ] && WAN_IFACE=$(ip route show 2>/dev/null | grep default | sed -re '/^default/ s/default.*dev +([^ ]+).*/\1/')
+
+copy_arp
+setup_iptables BWMON_INPUT INPUT $WAN_IFACE
+setup_iptables BWMON_OUTPUT OUTPUT $WAN_IFACE
+setup_iptables BWMON FORWARD $WAN_IFACE
+
+;;
+
+"remove-rules" )
+iptables -D BWMON -j BWMON_INPUT
+iptables -D BWMON -j BWMON_OUTPUT
+iptables -D FORWARD -j BWMON
+iptables -D INPUT -j BWMON_INPUT
+iptables -D OUTPUT -j BWMON_OUTPUT
+iptables -D FORWARD -j FORWARD_PRECOUNT
+iptables -D FORWARD -j FORWARD_POSTCOUNT
+iptables -D INPUT -j INPUT_PRECOUNT
+iptables -D INPUT -j INPUT_POSTCOUNT
+iptables -D OUTPUT -j OUTPUT_PRECOUNT
+iptables -D OUTPUT -j OUTPUT_POSTCOUNT
+iptables -F BWMON
+iptables -F BWMON_INPUT
+iptables -F BWMON_OUTPUT
+iptables -F FORWARD_PRECOUNT
+iptables -F FORWARD_POSTCOUNT
+iptables -F INPUT_PRECOUNT
+iptables -F INPUT_POSTCOUNT
+iptables -F OUTPUT_PRECOUNT
+iptables -F OUTPUT_POSTCOUNT
+iptables -X BWMON
+iptables -X BWMON_INPUT
+iptables -X BWMON_OUTPUT
+iptables -X FORWARD_PRECOUNT
+iptables -X FORWARD_POSTCOUNT
+iptables -X INPUT_PRECOUNT
+iptables -X INPUT_POSTCOUNT
+iptables -X OUTPUT_PRECOUNT
+iptables -X OUTPUT_POSTCOUNT
+;;
+
+"update" )
+if [ -z "${2}" ]
+then
+if [ $(check_archive) == "TRUE" ]
+then
+if [ ! -f /tmp/csvbwmon/other/archive_now.txt ]
+then
+touch /tmp/csvbwmon/other/archive_now.txt
+echo "Please run $0 archive"
+else
+# nohup "$0" archive > /dev/null 2>&1 &
+# touch /tmp/csvbwmon/other/archive_yes.txt
+rm -f /tmp/csvbwmon/other/archive_now.txt
+"$0" archive background
+exit
+fi
+exit
+else
+[ -f /tmp/csvbwmon/other/archive_now.txt ] && rm -f /tmp/csvbwmon/other/archive_now.txt
+fi
+if [ $INSTALL_TYPE == "file" ]
+then
+uf="$(get_config datadir)/usage.db"
+[ -f "$uf" ] || set_config current $(date +"%m-%d-%y")
+[ -f "$uf" ] || touch "$uf"
+fi
+if [ $INSTALL_TYPE == "nvram" ]
+then
+uf="/tmp/perm_usage.db"
+rm -f "$uf"
+if [ $(resource_exists currentData) == "true" ]
+then
+load_resource currentData "$uf"
+else
+touch "$uf"
+set_config current $(date +"%m-%d-%y")
+fi
+fi
+else
+uf="$2"
+fi
+
+lock
+
+copy_arp
+while [ ! -f /tmp/csvbwmon/other/arp.txt ]
+do
+copy_arp
+sleep 1
+done
+
+iptables -L BWMON_INPUT -vnxZ -t filter > /tmp/traffic_sin_$$.tmp
+iptables -L BWMON_OUTPUT -vnxZ -t filter > /tmp/traffic_sout_$$.tmp
+iptables -L BWMON -vnxZ -t filter > /tmp/traffic_$$.tmp
+
+grep -v "IP" /tmp/csvbwmon/other/arp.txt > /tmp/arp_$$.tmp
+echo "router TYPE FLAGS 00:00:00:00:00:00 MASK IFACE" >> /tmp/arp_$$.tmp
+
+while read IP TYPE FLAGS MACU MASK IFACE
+do
+[ -z "$MACU" ] && MAC="00:00:00:00:00:00" || MAC="$MACU"
+if [ $IP == "router" ]
+then
+grep RETURN /tmp/traffic_sin_$$.tmp | while read PKTS BYTES TARGET PROT OPT IFIN IFOUT SRC DST
+do
+echo ${BYTES} > /tmp/in_$$.tmp
+done
+grep RETURN /tmp/traffic_sout_$$.tmp | while read PKTS BYTES TARGET PROT OPT IFIN IFOUT SRC DST
+do
+echo ${BYTES} > /tmp/out_$$.tmp
+done
+else
+grep ${IP} /tmp/traffic_$$.tmp | while read PKTS BYTES TARGET PROT OPT IFIN IFOUT SRC DST
+do
+[ "${DST}" = "${IP}" ] && echo ${BYTES} > /tmp/in_$$.tmp
+[ "${SRC}" = "${IP}" ] && echo ${BYTES} > /tmp/out_$$.tmp
+done
+fi
+if [ -f "/tmp/in_$$.tmp" ]
+then
+IN=$(cat /tmp/in_$$.tmp)
+rm -f /tmp/in_$$.tmp
+else
+IN=0
+fi
+if [ -f "/tmp/out_$$.tmp" ]
+then
+OUT=$(cat /tmp/out_$$.tmp)
+rm -f /tmp/out_$$.tmp
+else
+OUT=0
+fi
+
+if [ ${IN} -gt 0 -o ${OUT} -gt 0 ];  then
+
+LINE=$(grep ${MAC} ${uf})
+if [ -z "${LINE}" ]; then
+USAGE_IN=0
+USAGE_OUT=0
+else
+USAGE_IN=$(echo ${LINE} | cut -f2 -s -d, )
+USAGE_OUT=$(echo ${LINE} | cut -f3 -s -d, )
+fi
+
+USAGE_IN=$(sum_big "${USAGE_IN}" "${IN}")
+USAGE_OUT=$(sum_big "${USAGE_OUT}" "${OUT}")
+grep -v "${MAC}" ${uf} > /tmp/db_$$.tmp
+echo ${MAC},${USAGE_IN},${USAGE_OUT} >> /tmp/db_$$.tmp
+mv /tmp/db_$$.tmp ${uf}
+else
+USAGE_IN=0
+USAGE_OUT=0
+fi
+done < /tmp/arp_$$.tmp
+
+if [ $INSTALL_TYPE == "nvram" ]
+then
+save_text_resource currentData "$uf"
+rm -f "$uf"
+fi
+
+rm -f /tmp/*_$$.tmp
+unlock
+;;
+
+"publish" )
+if [ -z "${2}" ]
+then
+if [ $INSTALL_TYPE == "file" ]
+then
+uf="$(get_config datadir)/usage.db"
+[ -f "$uf" ] || exit
+fi
+if [ $INSTALL_TYPE == "nvram" ]
+then
+uf="/tmp/perm_usage_$$.db"
+rm -f "$uf" 2> /dev/null
+if [ $(resource_exists currentData) == "true" ]
+then
+load_resource currentData "$uf"
+else
+exit
+fi
+fi
+else
+uf="$2"
+fi
+
+
+mdf="/tmp/dic_$$.tmp"
+load_resource config "$mdf" 0
+
+[ -z $3 ] && wd="/tmp/www/usage.htm" || wd="$3"
+[ ! -z "$3" ] && [ $3 == "stdout" ] && wd="/tmp/stdout_$$.tmp"
+wod="$wd"
+wd="${wd}.tmp"
+ubn=$(get_config use-binary)
+if [ $ubn == "yes" ]
+then
+ubb=1024
+else
+ubb=1000
+fi
+lock
+echo "<html><head><title>Traffic</title><script type=\"text/javascript\">" > "$wd"
+echo "function getSize(size) {" >> "$wd"
+echo "var prefix=new Array(\"\",\"k\",\"M\",\"G\",\"T\",\"P\",\"E\",\"Z\"); var base=${ubb};" >> "$wd"
+echo "var pos=0; while (size>base) { size/=base; pos++; } if (pos > 2) precision=1000; else precision = 1;" >> "$wd"
+echo "return (Math.round(size*precision)/precision)+' '+prefix[pos];}" >> "$wd"
+echo "</script></head><body><h1>Total Usage :</h1>" >> "$wd"
+echo "<table border="1"><tr bgcolor=silver><th>User</th><th>Peak download</th><th>Peak upload</th><th>Offpeak download</th><th>Offpeak upload</th><th>Last seen</th></tr>" >> "$wd"
+echo "<script type=\"text/javascript\">" >> "$wd"
+echo "var values = new Array(" >> "$wd"
+while IFS=, read MAC USAGE_IN USAGE_OUT
+do
+echo "new Array(" >> "$wd"
+USER="$(lookup "$MAC" "$mdf")"
+[ -z "$USER" ] && USER=${MAC}
+echo "\"${USER}\",${USAGE_IN},${USAGE_OUT},0,0,\"NA\")," >> "$wd"
+done < "$uf"
+echo "0);" >> "$wd"
+echo "for (i=0; i < values.length-1; i++) {document.write(\"<tr><td>\");" >> "$wd"
+echo "document.write(values[i][0]);document.write(\"</td><td>\");" >> "$wd"
+echo "document.write(getSize(values[i][1]));document.write(\"</td><td>\");" >> "$wd"
+echo "document.write(getSize(values[i][2]));document.write(\"</td><td>\");" >> "$wd"
+echo "document.write(getSize(values[i][3]));document.write(\"</td><td>\");" >> "$wd"
+echo "document.write(getSize(values[i][4]));document.write(\"</td><td>\");" >> "$wd"
+echo "document.write(values[i][5]);document.write(\"</td></tr>\");" >> "$wd"
+echo "}</script></table>" >> "$wd"
+echo "<br /><small>This page was generated on `date`</small>" 2>&1 >> "$wd"
+echo "</body></html>" >> "$wd"
+mv "$wd" "$wod"
+wd="$wod"
+unlock
+
+[ ! -z "$3" ] && [ $3 == "stdout" ] && cat /tmp/stdout_$$.tmp
+
+rm -f /tmp/*_$$.tmp
+
+;;
+
+"start" )
+nd=$(date +"%m-%d-%y")
+[ $(check_archive) == "TRUE" ] && "$0" archive
+
+dp1="/tmp/csvbwmon/other/csvbwmon-iptablesd"
+dp2="/tmp/csvbwmon/other/csvbwmon-updated"
+dp="$dp1"
+echo "#!/bin/sh" > "$dp"
+echo "CYCLETIME=2" >> "$dp"
+echo "while true" >> "$dp"
+echo "do" >> "$dp"
+echo "/tmp/csvbwmon/cmd/csvbwmon setup" >> "$dp"
+echo 'sleep $CYCLETIME & echo $! > /tmp/csvbwmon/other/setup_sleep.txt' >> "$dp"
+echo '[ -f /tmp/csvbwmon/other/stop.txt ] && break' >> "$dp"
+echo "done" >> "$dp"
+chmod +x "$dp"
+
+lr=$(lighttpd_running)
+
+if [ $lr == "true" ]
+then
+ct=60
+else
+ct=10
+fi
+
+dp="$dp2"
+echo "#!/bin/sh" > "$dp"
+echo "CYCLETIME=$ct" >> "$dp"
+echo "while true" >> "$dp"
+echo "do" >> "$dp"
+echo "/tmp/csvbwmon/cmd/csvbwmon update" >> "$dp"
+echo "/tmp/csvbwmon/cmd/csvbwmon publish" >> "$dp"
+echo "if [ -f /tmp/csvbwmon/other/archive_yes.txt ]; then" >> "$dp"
+echo "rm -f /tmp/csvbwmon/other/archive_yes.txt" >> "$dp"
+echo "nohup /tmp/csvbwmon/cmd/csvbwmon archive >> /dev/null 2>&1 &" >> "$dp"
+echo "exit" >> "$dp"
+echo "fi" >> "$dp"
+
+echo 'sleep $CYCLETIME & echo $! > /tmp/csvbwmon/other/update_sleep.txt' >> "$dp"
+echo '[ -f /tmp/csvbwmon/other/stop.txt ] && break' >> "$dp"
+echo "done" >> "$dp"
+chmod +x "$dp"
+
+mkdir "/tmp/cron-csv"
+if [ -d "/tmp/cron.d" ]
+then
+cp -R "/tmp/cron.d/." "/tmp/cron-csv/"
+else
+mkdir "/tmp/cron.d"
+fi
+mt=$(get_config "archive-time")
+mt=$(echo "$mt" | sed -e 's/:/ /g')
+stopservice cron > /dev/null 2>&1
+stopservice crond > /dev/null 2>&1
+echo "$mt * * * root sh /tmp/csvbwmon/cmd/csvbwmon archive" > /tmp/cron-csv/csvbwmon
+[ -d "/tmp/cron.d" ] && rm -rf "/tmp/cron.d"
+mv "/tmp/cron-csv" "/tmp/cron.d"
+startservice cron > /dev/null 2>&1
+startservice crond > /dev/null 2>&1
+nohup "$dp1" > /dev/null 2>&1 & echo "$!" > /tmp/csvbwmon/other/setup_pid.txt
+nohup "$dp2" > /dev/null 2>&1 & echo "$!" > /tmp/csvbwmon/other/update_pid.txt
+echo "Daemon started."
+
+;;
+
+"stop" )
+echo "done" > /tmp/csvbwmon/other/stop.txt
+u=$(cat /tmp/csvbwmon/other/update_pid.txt)
+while [ -e /proc/$u ]
+do
+us=$(cat /tmp/csvbwmon/other/update_sleep.txt)
+[ -e /proc/$us ] && kill $us > /dev/null 2>&1
+sleep 1
+done
+s=$(cat /tmp/csvbwmon/other/setup_pid.txt)
+while [ -e /proc/$s ]
+do
+ss=$(cat /tmp/csvbwmon/other/setup_sleep.txt)
+[ -e /proc/$ss ] && kill $ss > /dev/null 2>&1
+sleep 1
+done
+rm -f /tmp/csvbwmon/other/stop.txt
+# killall csvbwmon-iptablesd > /dev/null 2>&1
+# killall csvbwmon-updated > /dev/null 2>&1
+
+mkdir "/tmp/cron-csv"
+cp -R "/tmp/cron.d/." "/tmp/cron-csv/"
+rm -f "/tmp/cron-csv/csvbwmon" > /dev/null 2>&1
+stopservice cron > /dev/null 2>&1
+stopservice crond > /dev/null 2>&1
+[ -d "/tmp/cron.d" ] && rm -rf "/tmp/cron.d"
+mv "/tmp/cron-csv" "/tmp/cron.d"
+startservice cron > /dev/null 2>&1
+startservice crond > /dev/null 2>&1
+echo "Daemon stopped."
+
+;;
+
+"archive" )
+nd=$(date +"%m-%d-%y")
+nt=$(date +"%k%M")
+fd=$(get_config "current")
+ft=$(get_config "archive-time")
+ft=$(echo "$ft" | sed -e 's/://g')
+if [ $fd == $nd ]
+then
+echo "Current session is still active. This task should automatically run at the configured time."
+exit
+else
+if [ $nt -lt $ft ]
+then
+echo "Current session is still active. This task should automatically run at the configured time."
+exit
+fi
+fi
+sr="false"
+[ -f "/tmp/cron.d/csvbwmon" ] && sr="true"
+[ -z "$2" ] || sr="false"
+[ $sr == "true" ] && "$0" stop > /dev/null
+if [ $INSTALL_TYPE == "file" ]
+then
+mdd="$(get_config datadir)"
+[ -d "$mdd/archive" ] || mkdir "$mdd/archive"
+mv "$mdd/usage.db" "$mdd/archive/$fd.db"
+"$0" publish "$mdd/archive/$fd.db" "$mdd/archive/$fd.htm"
+fi
+if [ $INSTALL_TYPE == "nvram" ]
+then
+an=$(get_config min-free-nvram)
+load_resource currentData "/tmp/prev_usage.db"
+if [ ! -z "$(cat /tmp/prev_usage.db)" ]
+then
+nvram get csvbwmon_archives > /tmp/csvbwmon_cur.tmp
+if [ $(get_free_nvram) -lt $an ]
+then
+if [ ! -z "$(cat /tmp/csvbwmon_cur.tmp)" ]
+then
+hd=$(cat /tmp/csvbwmon_cur.tmp | head -n 1)
+delete_archive "$hd"
+nvram get csvbwmon_archives > /tmp/csvbwmon_cur.tmp
+fi
+fi
+echo "$fd" >> /tmp/csvbwmon_cur.tmp
+sd=$(echo "$fd" | sed -e 's/-//g')
+save_text_resource "ar_$sd" "/tmp/prev_usage.db"
+save_text_resource "archives" "/tmp/csvbwmon_cur.tmp"
+rm -f /tmp/prev_usage.db
+rm -f /tmp/csvbwmon_cur.tmp
+delete_resource currentData
+fi
+fi
+set_config "current" "$nd"
+[ $sr == "true" ] && "$0" start > /dev/null
+
+;;
+
+"restart" )
+
+"$0" stop
+"$0" start
+
+;;
+
+"get" )
+get_config "$2"
+
+;;
+
+"set" )
+set_config "$2" "$3"
+;;
+
+"get-mac" )
+m=$(echo "$2" | tr '[A-Z]' '[a-z]')
+get_mac "$m"
+
+;;
+
+"set-mac" )
+m=$(echo "$2" | tr '[A-Z]' '[a-z]')
+set_mac "$m" "$3"
+;;
+
+"write-mac" )
+i=/tmp/comp_read_$$.tmp
+cat /dev/stdin > $i
+write_mac "" "$i"
+rm -f $i
+;;
+
+"export" )
+make_csv "$2"
+;;
+
+"read-mac" )
+read_mac
+;;
+
+"unload" )
+cp "$0" /tmp/csvbwmon_temp
+chmod +x /tmp/csvbwmon_temp
+/tmp/csvbwmon_temp unload-go
+;;
+
+"unload-go" )
+echo "Unloading csvbwmon..."
+[ -f "/tmp/cron.d/csvbwmon" ] && "$0" stop
+"$0" remove-rules
+if [ -f /tmp/preCSVProfile ]
+then
+rm -f /tmp/newProfile > /dev/null 2>&1
+cat /tmp/preCSVProfile > /tmp/newProfile > /dev/null 2>&1
+chmod +x /tmp/newProfile > /dev/null 2>&1
+else
+umount /tmp/newProfile /etc/profile > /dev/null 2>&1
+rm -f /tmp/newProfile > /dev/null 2>&1
+fi
+[ -L /tmp/www/wrtbwmon ] && rm -f /tmp/www/wrtbwmon
+rm -f /tmp/www/csvbwmon.php
+[ -f /tmp/www/usage.htm ] && rm -f /tmp/www/usage.htm
+rm -rf /tmp/csvbwmon
+[ -f /tmp/csvbwmon_uninstall ] || rm -f /tmp/csvbwmon_temp
+;;
+
+"uninstall" )
+read -p "Are you sure you want to uninstall csvbwmon? " -n 1 -r
+echo
+if [[ $REPLY =~ ^[Yy]$ ]]
+then
+cp "$0" /tmp/csvbwmon_temp
+chmod +x /tmp/csvbwmon_temp
+/tmp/csvbwmon_temp uninstall-go
+fi
+;;
+
+"uninstall-go" )
+touch /tmp/csvbwmon_uninstall
+cd /tmp
+/tmp/csvbwmon_temp unload-go
+if [ $INSTALL_TYPE == "nvram" ]
+then
+list_archives > /tmp/csvbwmon_del_arch.tmp
+while IFS= read -r line
+do
+delete_archive "$line"
+done < /tmp/csvbwmon_del_arch.tmp
+rm -f /tmp/csvbwmon_del_arch.tmp
+nvram unset csvbwmon_archives > /dev/null 2>&1
+nvram unset csvbwmon_currentData > /dev/null 2>&1
+nvram commit
+fi
+delete_resource webgui
+delete_resource bulk
+delete_resource init
+delete_resource config
+nvram get rc_startup > /tmp/rc_$$.tmp
+x="true"
+while IFS= read -r line
+do
+if [ "$line" == "# BEGIN_CSVBWMON_INIT" ]
+then
+x="false"
+fi
+if [ $x == "true" ]
+then
+echo "$line" >> /tmp/rc_new_$$.tmp
+fi
+if [ "$line" == "# END_CSVBWMON_INIT" ]
+then
+x="true"
+fi
+done < /tmp/rc_$$.tmp
+rm -f /tmp/rc_$$.tmp
+if [ -f /tmp/rc_new_$$.tmp ]
+then
+y=$(hexget_resource /tmp/rc_new_$$.tmp)
+nvram_install_set "rc_startup" "$y" 1
+rm -f /tmp/rc_new_$$.tmp
+else
+nvram set rc_startup=""
+fi
+rm -f /tmp/csvbwmon_uninstall
+nvram unset csvbwmon_type
+nvram unset csvbwmon_dir
+nvram commit
+echo "Uninstall complete."
+rm -f /tmp/csvbwmon_temp
+;;
+
+*)
+echo "Usage : $0 {setup|update|publish} [options...]"
+echo "Options : "
+echo "   $0 setup"
+echo "   $0 update database_file"
+echo "   $0 publish database_file path_of_html_report [user_file]"
+echo "Examples : "
+echo "   $0 setup"
+echo "   $0 update /tmp/usage.db"
+echo "   $0 publish /tmp/usage.db /www/user/usage.htm /jffs/users.txt"
+echo "Note : [user_file] is an optional file to match users with their MAC address"
+echo "       Its format is : 00:MA:CA:DD:RE:SS,username , with one entry per line"
+exit
+;;
+esac
